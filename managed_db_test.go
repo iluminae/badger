@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger/v3/options"
 	"github.com/dgraph-io/badger/v3/y"
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/stretchr/testify/require"
@@ -830,4 +831,91 @@ func TestZeroDiscardStats(t *testing.T) {
 			db.vlog.discardStats.Iterate(func(id, val uint64) { require.Zero(t, val) })
 		})
 	})
+}
+
+func TestCompactionCorruption(t *testing.T) {
+	threads := 1000
+	dur := 10 * time.Minute
+
+	dir := t.TempDir()
+	opt := DefaultOptions("").
+		WithDir(dir).
+		WithValueDir(dir).
+		WithCompression(options.Snappy).
+		WithNumGoroutines(8).
+		WithNumVersionsToKeep(math.MaxInt32).
+		WithNamespaceOffset(1).
+		WithSyncWrites(false)
+	opt.DetectConflicts = false
+	pstore, err := OpenManaged(opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closer := make(chan struct{})
+	go func() {
+
+		// Runs every 1m, checks size of vlog and runs GC conditionally.
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
+		abs := func(a, b int64) int64 {
+			if a > b {
+				return a - b
+			}
+			return b - a
+		}
+
+		var lastSz int64
+		runGC := func() {
+			for err := error(nil); err == nil; {
+				err = pstore.RunValueLogGC(0.7)
+			}
+			_, sz := pstore.Size()
+			if abs(lastSz, sz) > 512<<20 {
+				lastSz = sz
+			}
+		}
+
+		runGC()
+		for {
+			select {
+			case <-closer:
+				return
+			case <-ticker.C:
+				runGC()
+			}
+		}
+	}()
+
+	var ts uint64
+
+	wg := sync.WaitGroup{}
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-closer:
+					return
+				default:
+				}
+				txn := pstore.NewTransactionAt(ts, true)
+				txn.SetEntry(
+					&Entry{
+						Key:      []byte(fmt.Sprintf("1key%d", i)),
+						Value:    []byte(fmt.Sprintf("1val%d%d", i, ts)),
+						UserMeta: 0x04,
+					},
+				)
+				txn.CommitAt(ts, nil)
+			}
+		}(i)
+	}
+	t.Logf("letting the %d threads run for %s", threads, dur.String())
+	time.Sleep(dur)
+	t.Log("shutting down")
+	close(closer)
+	wg.Wait()
+	t.Log("shut down")
 }
