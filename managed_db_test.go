@@ -1,6 +1,7 @@
 package badger
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -834,8 +835,12 @@ func TestZeroDiscardStats(t *testing.T) {
 }
 
 func TestCompactionCorruption(t *testing.T) {
-	threads := 1000
-	dur := 10 * time.Minute
+	var (
+		threads = 10000
+		dur     = 15 * time.Minute
+		ts      uint64
+		txns    uint64
+	)
 
 	dir := t.TempDir()
 	opt := DefaultOptions("").
@@ -868,9 +873,11 @@ func TestCompactionCorruption(t *testing.T) {
 		var lastSz int64
 		runGC := func() {
 			for err := error(nil); err == nil; {
+				t.Log("running RunValueLogGC()")
 				err = pstore.RunValueLogGC(0.7)
 			}
 			_, sz := pstore.Size()
+			t.Logf("vlog size: %d bytes", sz)
 			if abs(lastSz, sz) > 512<<20 {
 				lastSz = sz
 			}
@@ -878,6 +885,7 @@ func TestCompactionCorruption(t *testing.T) {
 
 		runGC()
 		for {
+			pstore.SetDiscardTs(atomic.LoadUint64(&ts))
 			select {
 			case <-closer:
 				return
@@ -886,8 +894,6 @@ func TestCompactionCorruption(t *testing.T) {
 			}
 		}
 	}()
-
-	var ts uint64
 
 	wg := sync.WaitGroup{}
 	for i := 0; i < threads; i++ {
@@ -900,15 +906,41 @@ func TestCompactionCorruption(t *testing.T) {
 					return
 				default:
 				}
-				txn := pstore.NewTransactionAt(ts, true)
-				txn.SetEntry(
+				tsl := atomic.AddUint64(&ts, 1)
+				txn := pstore.NewTransactionAt(tsl, true)
+				err := txn.SetEntry(
 					&Entry{
 						Key:      []byte(fmt.Sprintf("1key%d", i)),
-						Value:    []byte(fmt.Sprintf("1val%d%d", i, ts)),
+						Value:    []byte(fmt.Sprintf("1val%d%d", i, tsl)),
 						UserMeta: 0x04,
 					},
 				)
-				txn.CommitAt(ts, nil)
+				if err != nil {
+					t.Logf("set Entry err: %s", err)
+					txn.Discard()
+					continue
+				}
+				if err := txn.CommitAt(tsl, nil); err != nil {
+					t.Fatal(err)
+				}
+				x := atomic.AddUint64(&txns, 1)
+				if x%100000 == 0 {
+					t.Logf("txs run: %d", x)
+				}
+				if x%uint64(1000*(i+1)) == 0 {
+					txn := pstore.NewTransactionAt(tsl, false)
+					itm, err := txn.Get([]byte(fmt.Sprintf("1key%d", i)))
+					if err != nil {
+						t.Logf("Read Err: %s", err)
+					}
+					itm.Value(func(val []byte) error {
+						if string(val) != fmt.Sprintf("1val%d%d", i, tsl) {
+							return errors.New("bad val")
+						}
+						return nil
+					})
+				}
+
 			}
 		}(i)
 	}
