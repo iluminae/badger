@@ -1,7 +1,6 @@
 package badger
 
 import (
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -835,119 +834,115 @@ func TestZeroDiscardStats(t *testing.T) {
 }
 
 func TestCompactionCorruption(t *testing.T) {
-	var (
-		threads = 10000
-		dur     = 15 * time.Minute
-		ts      uint64
-		txns    uint64
-	)
+	for {
+		var (
+			threads = 10
+			dur     = 2 * time.Minute
+			ts      uint64
+			txns    uint64
+		)
 
-	dir := t.TempDir()
-	opt := DefaultOptions("").
-		WithDir(dir).
-		WithValueDir(dir).
-		WithCompression(options.Snappy).
-		WithNumGoroutines(8).
-		WithNumVersionsToKeep(math.MaxInt32).
-		WithNamespaceOffset(1).
-		WithSyncWrites(false)
-	opt.DetectConflicts = false
-	pstore, err := OpenManaged(opt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	closer := make(chan struct{})
-	go func() {
-
-		// Runs every 1m, checks size of vlog and runs GC conditionally.
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-
-		abs := func(a, b int64) int64 {
-			if a > b {
-				return a - b
-			}
-			return b - a
+		dir := "/work/dbtest" //t.TempDir()
+		opt := DefaultOptions("").
+			WithDir(dir).
+			WithValueDir(dir).
+			WithCompression(options.Snappy).
+			WithNumGoroutines(8).
+			WithNumVersionsToKeep(math.MaxInt32).
+			WithNamespaceOffset(1).
+			WithSyncWrites(false)
+		opt.DetectConflicts = false
+		pstore, err := OpenManaged(opt)
+		if err != nil {
+			t.Fatal(err)
 		}
-
-		var lastSz int64
-		runGC := func() {
-			for err := error(nil); err == nil; {
-				t.Log("running RunValueLogGC()")
-				err = pstore.RunValueLogGC(0.7)
-			}
-			_, sz := pstore.Size()
-			t.Logf("vlog size: %d bytes", sz)
-			if abs(lastSz, sz) > 512<<20 {
-				lastSz = sz
-			}
-		}
-
-		runGC()
-		for {
-			pstore.SetDiscardTs(atomic.LoadUint64(&ts))
-			select {
-			case <-closer:
-				return
-			case <-ticker.C:
-				runGC()
-			}
-		}
-	}()
-
-	wg := sync.WaitGroup{}
-	for i := 0; i < threads; i++ {
+		closer := make(chan struct{})
+		wg := sync.WaitGroup{}
 		wg.Add(1)
-		go func(i int) {
+		go func() {
+			// Runs every 1m, checks size of vlog and runs GC conditionally.
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
 			defer wg.Done()
+
+			abs := func(a, b int64) int64 {
+				if a > b {
+					return a - b
+				}
+				return b - a
+			}
+
+			var lastSz int64
+			runGC := func() {
+				for i, err := 1, error(nil); err == nil; i++ {
+					t.Logf("running RunValueLogGC()x%d", i)
+					err = pstore.RunValueLogGC(0.7)
+				}
+				_, sz := pstore.Size()
+				if abs(lastSz, sz) > 512<<20 {
+					lastSz = sz
+				}
+			}
+
+			runGC()
 			for {
+				pstore.SetDiscardTs(atomic.LoadUint64(&ts))
 				select {
 				case <-closer:
 					return
-				default:
+				case <-ticker.C:
+					runGC()
 				}
-				tsl := atomic.AddUint64(&ts, 1)
-				txn := pstore.NewTransactionAt(tsl, true)
-				err := txn.SetEntry(
-					&Entry{
-						Key:      []byte(fmt.Sprintf("1key%d", i)),
-						Value:    []byte(fmt.Sprintf("1val%d%d", i, tsl)),
-						UserMeta: 0x04,
-					},
-				)
-				if err != nil {
-					t.Logf("set Entry err: %s", err)
-					txn.Discard()
-					continue
-				}
-				if err := txn.CommitAt(tsl, nil); err != nil {
-					t.Fatal(err)
-				}
-				x := atomic.AddUint64(&txns, 1)
-				if x%100000 == 0 {
-					t.Logf("txs run: %d", x)
-				}
-				if x%uint64(1000*(i+1)) == 0 {
-					txn := pstore.NewTransactionAt(tsl, false)
-					itm, err := txn.Get([]byte(fmt.Sprintf("1key%d", i)))
-					if err != nil {
-						t.Logf("Read Err: %s", err)
-					}
-					itm.Value(func(val []byte) error {
-						if string(val) != fmt.Sprintf("1val%d%d", i, tsl) {
-							return errors.New("bad val")
-						}
-						return nil
-					})
-				}
-
 			}
-		}(i)
+		}()
+
+		for i := 0; i < threads; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				for {
+					select {
+					case <-closer:
+						return
+					default:
+					}
+					tsl := atomic.AddUint64(&ts, 1)
+					txn := pstore.NewTransactionAt(tsl, true)
+					err := txn.SetEntry(
+						&Entry{
+							Key:      []byte("1key"),
+							Value:    []byte(fmt.Sprintf("1val%d%d", i, tsl)),
+							UserMeta: 0x04,
+						},
+					)
+					if err != nil {
+						t.Logf("set Entry err: %s", err)
+						txn.Discard()
+						continue
+					}
+					if err := txn.CommitAt(tsl, nil); err != nil {
+						t.Log("commit error!")
+						t.Fatal(err)
+					}
+					x := atomic.AddUint64(&txns, 1)
+					if x%1000000 == 0 {
+						t.Logf("txs run: %d", x)
+					}
+					// read every now and again to keep it on its toes
+					if x%uint64(1000*(i+1)) == 0 {
+						if _, err := pstore.NewTransactionAt(tsl, false).Get([]byte("1key")); err != nil {
+							t.Logf("Read Err: %s", err)
+						}
+					}
+				}
+			}(i)
+		}
+		t.Logf("letting the %d threads run for %s", threads, dur.String())
+		time.Sleep(dur)
+		t.Log("shutting down")
+		close(closer)
+		wg.Wait()
+		pstore.Close()
+		t.Log("shut down")
 	}
-	t.Logf("letting the %d threads run for %s", threads, dur.String())
-	time.Sleep(dur)
-	t.Log("shutting down")
-	close(closer)
-	wg.Wait()
-	t.Log("shut down")
 }
