@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"runtime/debug"
 
 	"github.com/dgraph-io/badger/v3/options"
 	"github.com/dgraph-io/badger/v3/pb"
@@ -471,6 +472,8 @@ func newCreateChange(
 }
 
 func newDeleteChange(id uint64) *pb.ManifestChange {
+	println("DELETE CHANGE")
+	debug.PrintStack()
 	return &pb.ManifestChange{
 		Id: id,
 		Op: pb.ManifestChange_DELETE,
