@@ -416,6 +416,7 @@ func ReplayManifestFile(fp *os.File) (Manifest, int64, error) {
 func applyManifestChange(build *Manifest, tc *pb.ManifestChange) error {
 	switch tc.Op {
 	case pb.ManifestChange_CREATE:
+		println("CREATE MANIFEST CHANGE")
 		if _, ok := build.Tables[tc.Id]; ok {
 			return fmt.Errorf("MANIFEST invalid, table %d exists", tc.Id)
 		}
@@ -430,6 +431,7 @@ func applyManifestChange(build *Manifest, tc *pb.ManifestChange) error {
 		build.Levels[tc.Level].Tables[tc.Id] = struct{}{}
 		build.Creations++
 	case pb.ManifestChange_DELETE:
+		println("DELETE MANIFEST CHANGE")
 		tm, ok := build.Tables[tc.Id]
 		if !ok {
 			return fmt.Errorf("MANIFEST removes non-existing table %d", tc.Id)
@@ -446,6 +448,7 @@ func applyManifestChange(build *Manifest, tc *pb.ManifestChange) error {
 // This is not a "recoverable" error -- opening the KV store fails because the MANIFEST file is
 // just plain broken.
 func applyChangeSet(build *Manifest, changeSet *pb.ManifestChangeSet) error {
+	println("APPLY CHANGE SETS")
 	for _, change := range changeSet.Changes {
 		if err := applyManifestChange(build, change); err != nil {
 			return err
